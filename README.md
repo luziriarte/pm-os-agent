@@ -1,4 +1,4 @@
-# Cortex: PM Chief-of-Staff Agent
+# Cortex: PM Chief-of-Staff Agent, byLuz
 
 > My final project for Product School's **Agentic Loops for PMs** certification. A chief-of-staff agent that turns raw inputs (project state, GitHub/Jira activity, roadmap, past updates) into finished PM work, a leadership status update and a proposed backlog for a human to clear, built loop-first, bounded, grown into a fleet, and shipped up the Trust Ladder.
 
