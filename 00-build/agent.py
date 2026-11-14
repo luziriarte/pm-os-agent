@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import anthropic
@@ -49,7 +50,10 @@ MODEL = os.environ.get("CORTEX_MODEL", "claude-opus-5-5")
 EFFORT = os.environ.get("CORTEX_EFFORT", "medium")
 MAX_TOKENS = 16000  # per-response ceiling, so one reply can't run away
 MAX_ITERATIONS = int(os.environ.get("CORTEX_MAX_ITERATIONS", "8"))
+# Loop Spec stuck rule: stop once the critic has rejected this many drafts.
 MAX_REVISIONS = int(os.environ.get("CORTEX_MAX_REVISIONS", "2"))
+# Loop Spec stuck rule: stop once the same data lookup has failed this many times.
+MAX_LOOKUP_FAILURES = int(os.environ.get("CORTEX_MAX_LOOKUP_FAILURES", "3"))
 COST_CAP_USD = float(os.environ.get("CORTEX_COST_CAP_USD", "0.50"))
 MAX_QUEUE_ITEMS = int(os.environ.get("CORTEX_MAX_QUEUE_ITEMS", "10"))
 # Rough $ per 1M tokens for your chosen model, set to match its pricing.
@@ -139,33 +143,58 @@ def banner(text: str) -> None:
     print(f"\n{'=' * 64}\n{text}\n{'=' * 64}")
 
 
-def emit_deliverable(which: str, draft: str, *, accepted: bool,
+# How a run ended, matching the Loop Spec's stop conditions (plus hard bounds).
+SUCCESS, ESCALATED, STUCK, HALTED = "success", "escalated", "stuck", "halted (bound)"
+
+DRAFT_HEADINGS = {
+    SUCCESS: "FINAL STATUS UPDATE (draft, validator-approved, NOT posted)",
+    ESCALATED: "ESCALATED DRAFT (held for your decision, NOT posted)",
+    STUCK: "LAST DRAFT (held, NOT posted, Cortex got stuck)",
+    HALTED: "LAST DRAFT (held, NOT posted, a hard bound stopped the run)",
+}
+
+
+def emit_deliverable(which: str, draft: str, *, outcome: str,
                      reason: str, cost: float) -> None:
     """Surface AND persist Cortex's drafted status update so it can't get lost in
     the scroll-back. This is still a DRAFT held for human review, never a post,
-    there is no publish tool, and an escalated run is held on purpose.
+    there is no publish tool, and an escalated or stuck run is held on purpose.
 
-    Runs on every exit: an accepted pass prints the FINAL update; a bound trip or
-    escalation prints the LAST draft it managed to write plus why it was held.
+    Runs on every exit, and logs every exit to run-output/run-log.md so stuck and
+    escalated runs are always on record. A success also notifies the PM (stand-in).
     """
-    banner("FINAL STATUS UPDATE (draft, validator-approved, NOT posted)" if accepted
-           else "LAST DRAFT (held, NOT posted, escalated to a human)")
+    banner(DRAFT_HEADINGS[outcome])
     if draft.strip():
         print(draft.rstrip())
     else:
         print("(Cortex stopped before it produced a draft, nothing to show.)")
-    if not accepted:
+    if outcome != SUCCESS:
         print(f"\nWhy it was held: {reason}")
 
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    root = Path(__file__).parent
+    out = OUTPUT_DIR / f"status-update-{which}.md"
     if draft.strip():
-        OUTPUT_DIR.mkdir(exist_ok=True)
-        out = OUTPUT_DIR / f"status-update-{which}.md"
-        state = "accepted by validator" if accepted else "HELD, escalated"
         out.write_text(
-            f"<!-- Cortex draft, {state}; NOT posted. Run cost ~ ${cost:.4f}. -->\n"
+            f"<!-- Cortex draft, {outcome}; NOT posted. Run cost ~ ${cost:.4f}. -->\n"
             f"<!-- {reason} -->\n\n{draft.rstrip()}\n", encoding="utf-8")
-        print(f"\nSaved draft -> {out.relative_to(Path(__file__).parent)}  "
+        print(f"\nSaved draft -> {out.relative_to(root)}  "
               f"(for your review, nothing was posted)")
+
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    log = OUTPUT_DIR / "run-log.md"
+    with log.open("a", encoding="utf-8") as f:
+        f.write(f"- {stamp} · task-{which} · **{outcome}** · {reason} · ~${cost:.4f}\n")
+    print(f"Logged -> {log.relative_to(root)}")
+
+    if outcome == SUCCESS:
+        # Stand-in for the Loop Spec's "notify the PM only" step: there is no
+        # messaging connector yet, so this writes to a local file and sends nothing.
+        note = f"task-{which}: draft ready for your review -> {out.relative_to(root)}"
+        banner("NOTIFY PM ONLY (stand-in, nothing was sent)")
+        print(note)
+        with (OUTPUT_DIR / "notifications.log").open("a", encoding="utf-8") as f:
+            f.write(f"{stamp} · to: PM only · {note}\n")
 
 
 def run(which: str = "happy") -> None:
@@ -184,14 +213,15 @@ def run(which: str = "happy") -> None:
         {"role": "user", "content": f"PM task brief:\n\n{task['body']}"},
     ]
     source_log: list[str] = [task["body"]]
-    revisions = 0
+    rejections = 0
+    lookup_failures: dict[str, int] = {}  # same tool + same inputs -> error count
     last_draft = ""
 
     for step in range(1, MAX_ITERATIONS + 1):
         if bounds.over_cap():
             reason = f"cost cap ${COST_CAP_USD} hit at ${bounds.cost:.4f}"
             banner(f"BOUND TRIPPED, {reason}. Halting and escalating to a human.")
-            emit_deliverable(which, last_draft, accepted=False,
+            emit_deliverable(which, last_draft, outcome=HALTED,
                              reason=reason, cost=bounds.cost)
             return
 
@@ -208,13 +238,14 @@ def run(which: str = "happy") -> None:
                       else f"a single reply hit the {MAX_TOKENS}-token cap")
             banner(f"STOPPED, {reason}. Escalating to a human. "
                    f"Run cost ≈ ${bounds.cost:.4f}")
-            emit_deliverable(which, last_draft, accepted=False,
+            emit_deliverable(which, last_draft, outcome=HALTED,
                              reason=reason, cost=bounds.cost)
             return
 
         calls = [b for b in resp.content if b.type == "tool_use"]
         if calls:
             results = []
+            stuck_on = None
             for call in calls:
                 fn, args = call.name, dict(call.input)
                 result = tools.TOOLS[fn](**args)
@@ -223,6 +254,21 @@ def run(which: str = "happy") -> None:
                 print(f"          -> {json.dumps(result)[:300]}")
                 results.append({"type": "tool_result", "tool_use_id": call.id,
                                 "content": json.dumps(result)})
+                # Loop Spec stuck rule: the same lookup keeps failing.
+                if isinstance(result, dict) and "error" in result:
+                    key = f"{fn}({json.dumps(args, sort_keys=True)})"
+                    lookup_failures[key] = lookup_failures.get(key, 0) + 1
+                    print(f"          (lookup failed {lookup_failures[key]}/"
+                          f"{MAX_LOOKUP_FAILURES})")
+                    if lookup_failures[key] >= MAX_LOOKUP_FAILURES:
+                        stuck_on = key
+            if stuck_on:
+                reason = (f"STUCK: {stuck_on} failed {MAX_LOOKUP_FAILURES} times; "
+                          f"stopping instead of guessing")
+                banner(f"{reason}. Run cost ≈ ${bounds.cost:.4f}")
+                emit_deliverable(which, last_draft, outcome=STUCK,
+                                 reason=reason, cost=bounds.cost)
+                return
             # All results go back together in one message.
             messages.append({"role": "user", "content": results})
             continue
@@ -239,32 +285,41 @@ def run(which: str = "happy") -> None:
         print(json.dumps({k: v for k, v in verdict.items() if k != "_usage"}, indent=2))
 
         if verdict["verdict"] == "pass":
+            if proposed.lstrip().upper().startswith("ESCALATE"):
+                # Loop Spec escalate rule: Cortex hit a human decision. The critic
+                # confirmed the escalation is safe; it is held, never "final".
+                why = proposed.lstrip().splitlines()[0]
+                banner(f"ESCALATED to a human, HITL checkpoint. Nothing posted, no "
+                       f"commitments made. Run cost ≈ ${bounds.cost:.4f}")
+                emit_deliverable(which, proposed, outcome=ESCALATED,
+                                 reason=why, cost=bounds.cost)
+                return
             banner(f"HITL CHECKPOINT, status update + any proposed stories queued for "
                    f"your review. Nothing posted, no commitments made. "
                    f"Run cost ≈ ${bounds.cost:.4f}")
-            emit_deliverable(which, proposed, accepted=True,
+            emit_deliverable(which, proposed, outcome=SUCCESS,
                              reason="validator passed", cost=bounds.cost)
             return
 
-        if revisions >= MAX_REVISIONS:
-            reason = f"validator rejected {MAX_REVISIONS}x (revision cap)"
-            banner(f"REVISION CAP hit ({MAX_REVISIONS}). Escalating to a human "
+        rejections += 1
+        if rejections >= MAX_REVISIONS:
+            reason = f"STUCK: validator rejected {rejections} drafts (revision cap)"
+            banner(f"REVISION CAP hit ({MAX_REVISIONS} rejections). Stopping "
                    f"instead of looping. Run cost ≈ ${bounds.cost:.4f}")
-            emit_deliverable(which, last_draft, accepted=False,
+            emit_deliverable(which, last_draft, outcome=STUCK,
                              reason=reason, cost=bounds.cost)
             return
 
-        revisions += 1
-        print(f"\n-> critic rejected; revision {revisions}/{MAX_REVISIONS}")
+        print(f"\n-> critic rejected ({rejections}/{MAX_REVISIONS}); revising")
         messages.append({"role": "user", "content":
                          "A validator rejected that for these reasons: "
                          f"{verdict['reasons']}. Fix it or escalate."})
 
+    reason = f"STUCK: {MAX_ITERATIONS} steps used without a validated draft"
     banner(f"MAX ITERATIONS ({MAX_ITERATIONS}) reached without finishing. "
-           f"Escalating. Run cost ≈ ${bounds.cost:.4f}")
-    emit_deliverable(which, last_draft, accepted=False,
-                     reason=f"max iterations ({MAX_ITERATIONS}) reached",
-                     cost=bounds.cost)
+           f"Run cost ≈ ${bounds.cost:.4f}")
+    emit_deliverable(which, last_draft, outcome=STUCK,
+                     reason=reason, cost=bounds.cost)
 
 
 if __name__ == "__main__":
